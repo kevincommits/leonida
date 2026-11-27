@@ -1,0 +1,54 @@
+GPU:        NVIDIA A100-SXM4-40GB (Ampere / GA100, PCI 10de:20b0), 40960 MiB (Google Colab A100 runtime)
+Driver:     NVIDIA 580.82.07 (driverVersion 580.82.7.0, proprietary), Vulkan 1.4.312 (loader 1.3.275,
+            conformance 1.4.1.3)
+Subgroup:   32..32
+OS:         Ubuntu 24.04.4 LTS, Linux 6.6.159+ (x86-64, Google Colab container)
+CPU:        Intel(R) Xeon(R) CPU @ 2.20GHz (12 vCPUs)
+RAM:        83 GiB reported
+Commit:     d1dff7949be62b6609c3c2ca937df7f50fbf1305 (main, 2026-11-26)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools 2026.4 (conda-forge),
+            glslang 15.1.0 (Ubuntu glslang-tools), GCC 13.3.0, CMake 3.31.10, Ninja, Ubuntu libvulkan-dev
+            (1.3.275 headers)
+Selection:  VK_LOADER_DRIVERS_SELECT='nv*'
+Build:      cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=ON -DLEONIDA_VULKAN_HEADERS_FETCH=ON
+
+ctest (portable Linux subset):
+            113/115 passed, 2 skipped (shader_library_corpus, vk_sync_validation), 0 failed (153.99 s)
+
+run_gpu_tests.py, 269 fixtures:
+            native:                209/269 passed, 59 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1: 244/269 passed, 24 skipped, 1 failed
+
+Failed in both full runs:
+  cs_imgatomic_ext: 6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101
+  Not specific to this GPU: this is the known fixture bug where the volume T# lacks the synthetic-UAV tag
+  (#1518, GPU-IMG-ATOMIC-EXT-VOLUME-TAG), also reproduced on RTX 5090, M5 Pro, RADV and llvmpipe.
+
+Skipped:
+- native: 34 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this device"
+  (ms_w64x_ballot), 1 "cannot require a 64-wide fragment subgroup" (ps_w64x_readlane), 3 "unsupported:
+  VK_KHR_maintenance8 (non-constant texel Offset)" (ps_texoff, ps_texoff_forms, ps_texoff_implicit — see
+  header note below), 19 documented "run by d3d12_*_test / w64_graphics.py" cases, and 1 "needs the
+  Windows D3D12 runtime" (cs_texture_uav). Total: 59.
+- LEONIDA_W64_EMULATE=1: the same 19 + 1 + ps_w64x_readlane + 3 ps_texoff* = 24 skipped.
+- Graphics, VK_KHR_fragment_shader_barycentric (ps_bary, ps_persp_bary, ps_ij_computed),
+  VK_EXT_mesh_shader (5/6 native; 6/6 including ms_w64x_ballot with LEONIDA_W64_EMULATE=1),
+  ps_nan_payload (4096/4096), and cs_imgstore_cube all passed natively on A100-SXM4-40GB.
+
+Additional checks:
+- probe_signed_zero.py (SHADER-605): Unknown 768/768 words exact; Rgba32f 768/768 words exact.
+
+Notes:
+- This machine is a Google Colab A100 GPU runtime (first NVIDIA A100-SXM4-40GB / Ampere GA100 datacenter
+  record). Despite being a headless datacenter SXM4 card, the NVIDIA 580.82.07 Vulkan driver exposes full
+  graphics, fragment barycentrics, and VK_EXT_mesh_shader.
+- Headless Colab containers ship NVIDIA driver libraries under /usr/lib64-nvidia/ without an ICD JSON in
+  /etc/vulkan/icd.d/, and libGLX_nvidia.so.0 returns NULL from vk_icdGetInstanceProcAddr("vkCreateInstance")
+  without an X server. Pointing /etc/vulkan/icd.d/nvidia_icd.json at /usr/lib64-nvidia/libEGL_nvidia.so.0
+  exposes the full NVIDIA 580.82.07 Vulkan 1.4.312 driver.
+- Because Ubuntu 24.04's libvulkan-dev (1.3.275 headers) was installed in /usr/include during this run,
+  vk_texture_test compiled without VK_KHR_MAINTENANCE_8_EXTENSION_NAME, causing the 3 ps_texoff* tests to
+  skip; this is a build-header omission rather than a missing A100 driver capability.
+- No game files were used; only the synthetic fixtures in runtime/test/shaders and portable runtime tests.
+- AI-assisted.
