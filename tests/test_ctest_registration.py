@@ -1,9 +1,12 @@
-"""Every test executable the runtime builds must be registered with ctest.
+"""Every test executable the runtime builds must be registered with ctest, and every
+``runtime/test/*_test.cpp`` source file must belong to a CMake target.
 
 ``add_executable(foo_test ...)`` without an ``add_test(... COMMAND foo_test)`` builds
 the test but never runs it -- in ``ctest``, in the Windows runtime job or under Wine.
 This happened to ``d3d12_indirect_rt_test``; the only intentional exception is
 ``d3d12_clear_test`` (see the comment next to its target in runtime/CMakeLists.txt).
+A ``runtime/test/*_test.cpp`` file with no ``add_executable`` target at all stays dead
+in the same way, so the guard also checks the files on disk against ``runtime/CMakeLists.txt``.
 """
 import os
 import re
@@ -13,16 +16,75 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CMAKE = Path(os.environ.get("LEONIDA_RUNTIME_CMAKE", str(ROOT / "runtime" / "CMakeLists.txt")))
+RUNTIME_TEST_DIR = Path(os.environ.get("LEONIDA_RUNTIME_TEST_DIR", str(ROOT / "runtime" / "test")))
 SOURCE = Path(os.environ.get("LEONIDA_RUNTIME_TEST_SOURCE",
                              str(ROOT / "runtime" / "test" / "d3d12_indirect_rt_test.cpp")))
 
 # d3d12_clear_test is deliberately run by hand until #521's tie rounding lands.
 NOT_IN_CTEST = {"d3d12_clear_test"}
 
+_FOREACH_TOKEN_RE = re.compile(r"\b(foreach)\s*\(([^)]*)\)|\b(endforeach)\s*\([^)]*\)", re.I | re.S)
+
+
+def strip_cmake_comments(text):
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def _parse_foreach_header(header):
+    tokens = [tok.strip('"') for tok in header.split()]
+    if len(tokens) < 2:
+        return None, None
+    var = tokens[0]
+    rest = tokens[1:]
+    if rest and rest[0].upper() == "IN":
+        if len(rest) >= 2 and rest[1].upper() == "ITEMS":
+            return var, rest[2:]
+        return None, None
+    if rest and rest[0].upper() in {"RANGE", "ZIP_LISTS"}:
+        return None, None
+    return var, rest
+
+
+def expand_foreach_blocks(text):
+    """Expand simple literal-list foreach(...) blocks that declare or populate targets."""
+    current = text
+    for _ in range(64):
+        stack = []
+        innermost = None
+        for m in _FOREACH_TOKEN_RE.finditer(current):
+            if m.group(1):
+                stack.append(m)
+            elif stack:
+                start = stack.pop()
+                body = current[start.end():m.start()]
+                if not re.search(r"\b(?:add_executable|target_sources)\b", body, re.I):
+                    continue
+                var, items = _parse_foreach_header(start.group(2))
+                if var is not None and items is not None:
+                    innermost = (start, m, var, items)
+                    break
+        if innermost is None:
+            break
+        start, end, var, items = innermost
+        body = current[start.end():end.start()]
+        needle = "${" + var + "}"
+        expanded = "\n".join(body.replace(needle, item) for item in items)
+        current = current[:start.start()] + expanded + current[end.end():]
+    return current
+
 
 def built_test_executables(text):
     return {name for name in re.findall(r"add_executable\(\s*([A-Za-z0-9_]+)", text)
             if name.endswith("_test")}
+
+
+def built_test_sources(text):
+    """Return the set of ``*_test.cpp`` filenames built by add_executable/target_sources."""
+    expanded = expand_foreach_blocks(strip_cmake_comments(text))
+    sources = set()
+    for block in re.findall(r"\b(?:add_executable|target_sources)\s*\(([^)]*)\)", expanded, re.I | re.S):
+        sources.update(re.findall(r"\btest/([A-Za-z0-9_]+_test\.cpp)\b", block))
+    return sources
 
 
 def registered_commands(text):
@@ -38,6 +100,35 @@ class CTestRegistrationTest(unittest.TestCase):
     def test_all_test_executables_have_an_add_test(self):
         missing = built_test_executables(self.cmake) - registered_commands(self.cmake) - NOT_IN_CTEST
         self.assertEqual(missing, set(), f"built but never run by ctest: {sorted(missing)}")
+
+    def test_all_test_sources_have_a_cmake_target(self):
+        disk_sources = {p.name for p in RUNTIME_TEST_DIR.glob("*_test.cpp")}
+        missing = disk_sources - built_test_sources(self.cmake)
+        self.assertEqual(
+            missing,
+            set(),
+            f"runtime/test/*_test.cpp with no CMake target in runtime/CMakeLists.txt: {sorted(missing)}",
+        )
+
+    def test_built_test_sources_expands_foreach_and_ignores_comments(self):
+        cmake = (
+            "add_executable(direct_test test/direct_test.cpp)\n"
+            "# add_executable(commented_test test/commented_test.cpp)\n"
+            "foreach(t IN ITEMS a_test b_test)\n"
+            "  add_executable(${t} test/${t}.cpp)\n"
+            "endforeach()\n"
+            "foreach(name c d)\n"
+            "  add_executable(${name}_test test/${name}_test.cpp)\n"
+            "endforeach()\n"
+            "target_sources(direct_test PRIVATE test/extra_test.cpp)\n"
+        )
+        found = built_test_sources(cmake)
+        self.assertEqual(
+            found,
+            {"direct_test.cpp", "a_test.cpp", "b_test.cpp", "c_test.cpp", "d_test.cpp", "extra_test.cpp"},
+        )
+        self.assertNotIn("commented_test.cpp", found)
+        self.assertEqual({"direct_test.cpp", "orphan_test.cpp"} - found, {"orphan_test.cpp"})
 
     def test_the_exception_is_still_the_only_one(self):
         # An allowlist that grows unnoticed is how this bug happens again.
